@@ -473,22 +473,17 @@ class ContextCluster(nn.Module):
         x = self.forward_embeddings(x)
         # through backbone
         x = self.forward_tokens(x)
-        if self.fork_feat:
+        if self.fork_feat: 
             # otuput features of four stages for dense prediction
             return x
         x = self.norm(x)
-        cls_out = self.head(x.mean([-2, -1]))
+        cls_out = self.head(x.mean([-2, -1])) # 输出的张量是 [batch, classes]
         # for image classification
         return cls_out
 
 
 @register_model
-def coc_tiny(pretrained=False, **kwargs):
-    layers = [3, 4, 5, 2]
-    norm_layer = GroupNorm
-    embed_dims = [32, 64, 196, 320]
-    mlp_ratios = [8, 8, 4, 4]
-    downsamples = [True, True, True, True]
+def coc_tiny(pretrained=False, **kwargs):     
     proposal_w = [2, 2, 2, 2]
     proposal_h = [2, 2, 2, 2]
     fold_w = [8, 4, 2, 1]
