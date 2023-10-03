@@ -404,9 +404,11 @@ def main():
     if args.local_rank == 0:
         _logger.info(
             f'Model {safe_model_name(args.model)} created, param count:{sum([m.numel() for m in model.parameters()])}')
-
+    
+    # 解析数据配置
     data_config = resolve_data_config(vars(args), model=model, verbose=args.local_rank == 0)
 
+    # 数据增强的拆分方式
     # setup augmentation batch splits for contrastive loss or split bn
     num_aug_splits = 0
     if args.aug_splits > 0:
@@ -420,9 +422,12 @@ def main():
 
     # move model to GPU, enable channels last layout if set
     model.cuda()
+    # 设置内存的格式，通道优先是将通道维度放在内存中的连续块，而空间维度（例如图像的宽度和高度）在内存中是不连续的
+    # 通道最后则是相反  对此设置可以提高计算性能
     if args.channels_last:
         model = model.to(memory_format=torch.channels_last)
 
+    # 分布式训练相关配置
     # setup synchronized BatchNorm for distributed training
     if args.distributed and args.sync_bn:
         assert not args.split_bn
@@ -441,8 +446,10 @@ def main():
         assert not args.sync_bn, 'Cannot use SyncBatchNorm with torchscripted model'
         model = torch.jit.script(model)
 
+    # 创建优化器
     optimizer = create_optimizer_v2(model, **optimizer_kwargs(cfg=args))
 
+    # 配置混合精度计算
     # setup automatic mixed-precision (AMP) loss scaling and op casting
     amp_autocast = suppress  # do nothing
     loss_scaler = None
@@ -460,6 +467,7 @@ def main():
         if args.local_rank == 0:
             _logger.info('AMP not enabled. Training in float32.')
 
+    # 断点重新训练
     # optionally resume from a checkpoint
     resume_epoch = None
     if args.resume:
@@ -469,6 +477,7 @@ def main():
             loss_scaler=None if args.no_resume_opt else loss_scaler,
             log_info=args.local_rank == 0)
 
+    # 设置模型权重的指数移动平均 可以平滑模型的权重更新，并在一些训练任务中可以平滑模型的泛化性能
     # setup exponential moving average of model weights, SWA could be used here too
     model_ema = None
     if args.model_ema:
@@ -478,6 +487,7 @@ def main():
         if args.resume:
             load_checkpoint(model_ema.module, args.resume, use_ema=True)
 
+    # 配置模型的分布式训练
     # setup distributed training
     if args.distributed:
         if has_apex and use_amp == 'apex':
@@ -491,6 +501,7 @@ def main():
             model = NativeDDP(model, device_ids=[args.local_rank], broadcast_buffers=not args.no_ddp_bb)
         # NOTE: EMA model does not need to be wrapped by DDP
 
+    # 模型（断点）训练 的学习率配置
     # setup learning rate schedule and starting epoch
     lr_scheduler, num_epochs = create_scheduler(args, optimizer)
     start_epoch = 0
@@ -519,6 +530,7 @@ def main():
         download=args.dataset_download,
         batch_size=args.batch_size)
 
+    # 配置数据增强
     # setup mixup / cutmix
     collate_fn = None
     mixup_fn = None
@@ -587,6 +599,7 @@ def main():
         pin_memory=args.pin_mem,
     )
 
+    # 配置损失函数 根据不同的配置选择不同的损失函数
     # setup loss function
     if args.jsd_loss:
         assert num_aug_splits > 1  # JSD only valid with aug splits set
@@ -604,6 +617,7 @@ def main():
             train_loss_fn = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
     else:
         train_loss_fn = nn.CrossEntropyLoss()
+    # 损失函数是可以直接放进cuda！
     train_loss_fn = train_loss_fn.cuda()
     validate_loss_fn = nn.CrossEntropyLoss().cuda()
 
@@ -614,6 +628,7 @@ def main():
     saver = None
     output_dir = None
     if args.rank == 0:
+        # 配置输出目录的命名规范 同时输出模型实例的配置文件
         if args.experiment:
             exp_name = args.experiment
         else:
