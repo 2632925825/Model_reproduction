@@ -91,6 +91,9 @@ class GroupNorm(nn.GroupNorm):
 
 def pairwise_cos_sim(x1: torch.Tensor, x2: torch.Tensor):
     """
+    对输入张量的最后一个维度进行归一化
+    再求余弦相似度 为什么要进行这样的操作 这样的操作对模型有什么好处 这么做的目的是什么
+    有没有等价的操作 这个操作背后的数学思想是什么
     return pair-wise similarity matrix between two tensors
     :param x1: [B,...,M,D]
     :param x2: [B,...,N,D]
@@ -100,6 +103,7 @@ def pairwise_cos_sim(x1: torch.Tensor, x2: torch.Tensor):
     x2 = F.normalize(x2, dim=-1)
 
     sim = torch.matmul(x1, x2.transpose(-2, -1))
+    # 矩阵相乘操作常被用于计算特征之间的相似度、注意力权重等
     return sim
 
 
@@ -274,7 +278,7 @@ def basic_blocks(dim, index, layers,
                  proposal_w=2, proposal_h=2, fold_w=2, fold_h=2, heads=4, head_dim=24, return_center=False):
     blocks = []
     for block_idx in range(layers[index]):
-        block_dpr = drop_path_rate * ( block_idx + sum(layers[:index])) / (sum(layers) - 1)
+        block_dpr = drop_path_rate * ( block_idx + sum(layers[:index])) / (sum(layers) - 1)  # 这个drop_path 数学理论是啥？ 似乎现在都在用
         blocks.append(ClusterBlock(
             dim, mlp_ratio=mlp_ratio,
             act_layer=act_layer, norm_layer=norm_layer,
@@ -327,7 +331,7 @@ class ContextCluster(nn.Module):
         if not fork_feat:
             self.num_classes = num_classes
         self.fork_feat = fork_feat
-
+        # 第一个 嵌入层 输入的 C 维度是5（加上了位置信息）
         self.patch_embed = PointRecuder(
             patch_size=in_patch_size, stride=in_stride, padding=in_pad,
             in_chans=5, embed_dim=embed_dims[0])

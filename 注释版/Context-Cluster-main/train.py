@@ -314,7 +314,7 @@ def get_git_commit_id():
         # indicating no git found.
         return "0000000"
 
-
+# 读取配置文件
 def _parse_args():
     # Do we have a config file to parse?
     args_config, remaining = config_parser.parse_known_args()
@@ -342,8 +342,9 @@ def main():
         else: 
             _logger.warning("You've requested to log metrics to wandb but package not found. "
                             "Metrics not being logged to wandb, try `pip install wandb`")
-             
+    # 是否有预摘要           
     args.prefetcher = not args.no_prefetcher
+    # 配置分布式训练
     args.distributed = False
     if 'WORLD_SIZE' in os.environ:
         args.distributed = int(os.environ['WORLD_SIZE']) > 1
@@ -361,7 +362,8 @@ def main():
     else:
         _logger.info('Training with a single process on 1 GPUs.')
     assert args.rank >= 0
-
+    
+    # 是否使用混合精度
     # resolve AMP arguments based on PyTorch / Apex availability
     use_amp = None
     if args.amp:
@@ -377,7 +379,8 @@ def main():
     elif args.apex_amp or args.native_amp:
         _logger.warning("Neither APEX or native Torch AMP is available, using float32. "
                         "Install NVIDA apex or upgrade to PyTorch 1.6")
-
+    
+    # 随机种子
     random_seed(args.seed, args.rank)
 
     model = create_model(
