@@ -488,6 +488,11 @@ class ContextCluster(nn.Module):
 
 @register_model
 def coc_tiny(pretrained=False, **kwargs):     
+    layers = [3, 4, 5, 2]
+    norm_layer = GroupNorm
+    embed_dims = [32, 64, 196, 320]
+    mlp_ratios = [8, 8, 4, 4]
+    downsamples = [True, True, True, True]
     proposal_w = [2, 2, 2, 2]
     proposal_h = [2, 2, 2, 2]
     fold_w = [8, 4, 2, 1]
