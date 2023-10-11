@@ -797,7 +797,6 @@ class Yin(nn.Module):
         x = self.fpn_up(x)
         self.fpn_predict_up(x, logits)
 
-        # 很显然 以下logits输出是每个patch的得分 还要经过选择 另外就是这个先上先下有什么区别？
         # print(logits['layer1'].size())  torch.Size([32, 3136, 2000])
         # print(logits['layer2'].size())  torch.Size([32, 784, 2000])
         # print(logits['layer3'].size())  torch.Size([32, 196, 2000])
