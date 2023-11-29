@@ -17,6 +17,8 @@ from timm.models.registry import register_model
 from timm.models.layers.helpers import to_2tuple
 from einops import rearrange
 import torch.nn.functional as F
+import scipy.sparse as sp
+import numpy as np 
 
 try:
     from mmseg.models.builder import BACKBONES as seg_BACKBONES
@@ -55,6 +57,223 @@ default_cfgs = {
     'model_medium': _cfg(crop_pct=0.95),
 }
 
+def create_adj( H, W, C, neibour):
+    """
+    功能：
+        根据featuremap的高和宽建立对应的空域邻接矩阵,
+    输入：
+        h featuremap的高度
+        w featuremap的宽
+        C featuremap的通道数 
+        neibour  4或8决定空域adj的邻居数   2 决定计算channel的adj
+    """
+    h = H
+    w = W
+    n = h*w
+    x = [] #保存节点
+    y = [] #保存对应的邻居节点
+    #判断是生成8邻居还是4邻居
+    if neibour==8:
+        l =np.reshape(np.arange(n),(h,w))
+        # print(l)
+        # print(((l[:,2])+w)[:1])
+        #print(l[:,2])
+        for i in range(h): 
+            #邻界条件需要考虑，故掐头去尾先做中间再两边
+            r = l[i,:]
+            #左邻
+            x = np.append(x,r[1:]).astype(int) #0没有上一个邻居
+            y = np.append(y,(r-1)[1:]).astype(int)
+            #每个元素的右邻居
+            x = np.append(x,r[:-1]).astype(int) #最后一个没有下一个邻居
+            y = np.append(y,(r+1)[:-1]).astype(int) 
+            if i >0:
+                #上邻
+                x = np.append(x,r).astype(int) #最后一个没有下一个邻居
+                y = np.append(y,(r-w)).astype(int) 
+                #左上
+                x = np.append(x,r[1:]).astype(int) #最后一个没有下一个邻居
+                y = np.append(y,(r-w-1)[1:]).astype(int) 
+                #右上
+                x = np.append(x,r[:-1]).astype(int) #最后一个没有下一个邻居
+                y = np.append(y,(r-w+1)[:-1]).astype(int) 
+            if i <h-1:
+                #下邻
+                x = np.append(x,r).astype(int) #最后一个没有下一个邻居
+                y = np.append(y,(r+w)).astype(int) 
+                #左下
+                x = np.append(x,r[1:]).astype(int) #最后一个没有下一个邻居
+                y = np.append(y,(r+w-1)[1:]).astype(int) 
+                #右上
+                x = np.append(x,r[:-1]).astype(int) #最后一个没有下一个邻居
+                y = np.append(y,(r+w+1)[:-1]).astype(int)                           
+    elif neibour==4:       #4邻居
+        l =np.reshape(np.arange(n),(h,w))
+        for i in range(h): 
+            v = l[i,:]
+            x = np.append(x,v[1:]).astype(int) #0没有上一个邻居
+            y = np.append(y,(v-1)[1:]).astype(int)
+            #每个元素的右邻居
+            x = np.append(x,v[:-1]).astype(int) #最后一个没有下一个邻居
+            y = np.append(y,(v+1)[:-1]).astype(int) 
+
+        for i in range(w):
+            p = l[:,i]
+            #上邻
+            x = np.append(x,p[1:]).astype(int) #0没有上一个邻居
+            y = np.append(y,(p-w)[1:]).astype(int)
+            #下邻  
+            x = np.append(x,p[:-1]).astype(int) #0没有上一个邻居
+            y = np.append(y,(p+w)[:-1]).astype(int)
+    elif neibour==2:       #4邻居
+        n = C
+        l =np.arange(n)
+
+        #每个元素的上一个邻居
+        x = np.append(x,l[1:]).astype(int) #0没有上一个邻居
+        y = np.append(y,(l-1)[1:]).astype(int)
+        #每个元素的下一个邻居
+        x = np.append(x,l[:-1]).astype(int) #最后一个没有下一个邻居
+        y = np.append(y,(l+1)[:-1]).astype(int) 
+    adj = np.array((x,y)).T  #生成的两列合并得到节点及其邻居的矩阵
+    #print(adj)
+    #使用sp.coo_matrix() 和 np.ones() 共同生成临界矩阵，右边的
+
+    adj = sp.coo_matrix((np.ones(adj.shape[0]), (adj[:, 0], adj[:, 1])),shape=(n, n),dtype=np.float32)
+
+    # build symmetric adjacency matrix 堆成矩阵
+    adj = adj + adj.T.multiply(adj.T > adj) - adj.multiply(adj.T > adj)
+    #adj = np.hstack((x,y)).rehsape(-1,2) 这样reshape得到的是临近两个一组变化成两列，不符合条件
+    #adj =normalize( adj + sp.eye(adj.shape[0]))
+    adj = np.array(adj.todense())
+    ''''      保存adj的数据查看是什么形状      	'''
+    # np.save('./adj.txt',x) 
+    adj = torch.tensor(adj).cuda()
+    # adj = torch.tensor(adj)
+
+    #adj = torch.FloatTensor(x).cuda()
+    return adj
+
+
+class GraphAttentionLayer(nn.Module):
+	"""
+	描述：
+		再MPGA中，单层的GAT，输入输出的维度相同，attention的计算方式使用softmax
+		in_features：输入的维度，
+		down_ratio:降维的比例
+		out_feature:在多头注意力之中需要用
+	"""
+	def __init__(self, in_features,down_ratio=8,sgat_on=True,cgat_on=True):
+		super(GraphAttentionLayer, self).__init__()
+		#self.dropout = dropout
+		self.in_features = in_features
+		self.hid_features = in_features//down_ratio #数据降维，使用//保证输出的结果为整数
+		#alpha sigma两次降维后，做矩阵运算获得att，类似GAT中的先用w再用a获得注意力。
+		self.use_sgat = sgat_on
+		self.use_cgat = cgat_on
+		if self.use_sgat:
+			self.down_alpha = nn.Sequential( #无论是通道还是空域都需要先降维 图卷积的#默认使用hid_feature是
+				nn.Conv2d(in_channels=self.in_features, out_channels=self.hid_features, 
+						kernel_size=1, stride=1, padding=0, bias=False), #输入 in_features 2048 输出hid_features  in_features//down_ratio
+				nn.BatchNorm2d(self.hid_features),
+				nn.ReLU()
+			)
+
+			self.down_sigma = nn.Sequential( #无论是通道还是空域都需要先降维 图卷积的
+				nn.Conv2d(in_channels=self.in_features, out_channels=self.hid_features, 
+						kernel_size=1, stride=1, padding=0, bias=False),
+				nn.BatchNorm2d(self.hid_features),
+				nn.ReLU()
+			)
+	
+
+	def forward(self, x):#v 是输入的各个节点， b c h w是输入feature map的shape
+		#输入后都是先降维计算注意力，concat=false需要聚合特征前需要将输入的维度降低再聚合
+		b,c,h,w = x.size()
+
+		if self.use_sgat:
+			adj = create_adj(h,w,self.in_features,8)
+			#print('图片的维度：',x.size())
+			alpha = self.down_alpha(x)#concat的时候不太一样
+			#print('alpha :',alpha.shape)
+			#print('alpha.shape:',alpha.shape)
+			sigma = self.down_sigma(x)
+			#print('sigma :',sigma.shape)
+			alpha = alpha.view(b, self.hid_features, -1).permute(0, 2, 1) #8 32 64*32	
+			#print('转换后alpha :',alpha.shape)
+			sigma = sigma.view(b, self.hid_features, -1)
+			#print('转换后sigma :',sigma.shape)
+			att = torch.matmul(alpha, sigma) #这就是每个图的自注意力机制
+			#print('alpha乘sigma得到大的att shape:',att.shape)
+			zero_vec = -9e15*torch.ones_like(att)
+			attention = torch.where(adj.expand_as(att)> 0, att,zero_vec)
+			#print('attention shape:',attention.shape)
+			attention = F.softmax(attention, dim=2)  # 计算节点，临近节点的关系，因为attention为3维 b h w 按行求则为
+			#print('softmax(attention) shape:',attention.shape)
+			h_s = torch.matmul(attention, x.view(b, c, -1).permute(0, 2, 1)).permute(0,2,1).view(b,c,h,w)  #聚合临近节点的信息表示该节点
+			#print('图上传播后',h_prime.shape)
+		if self.use_cgat:
+			cadj = create_adj(h,w,c,2)#2表示通道的adj未进行节点维度的变化，直接点乘和sigmod计算的att
+			theta_xc = x.view(b, c, -1)
+			phi_xc = x.view(b, c, -1).permute(0, 2, 1) # 8 2048 256 1  batch_size 节点 channel
+			Gc = torch.matmul(theta_xc, phi_xc) # bactchsiz n n   通道之间的关系 
+			zero_vec = -9e15*torch.ones_like(Gc)
+			catt = torch.where(cadj.expand_as(Gc)> 0, Gc, zero_vec)
+			cattention = F.softmax(catt, dim=2)  # 计算节点，临近节点的关系，因为attention为3维 b h w 按行求则为
+			h_prime = torch.matmul(cattention, x.view(b, c, -1)).view(b,c,h,w)   #聚合临近节点的信息表示该节点
+		if self.use_cgat and self.use_sgat:
+			return torch.add(h_s, h_prime)
+		if self.use_cgat:
+			return h_prime #残差
+
+		return  h_s
+
+
+class GAT(nn.Module):
+    def __init__(self, nfeat,down_ratio=8,sgat_on=True,cgat_on=True):
+        """Dense version of GAT.
+        描述：
+            nfeat :输入的维度
+            nclass ：非concat时使用的输出维度
+            Height Width：输入的图片的大小
+            dow_ratio:concat时输入数据的维度降低倍数
+        """
+        super(GAT, self).__init__()
+        # self.nheads = 3
+        # print ('Use_SGAT_Att: {};\tUse_CGAT_Att: {}.'.format(sgat_on, cgat_on))
+        # self.attentions= nn.ModuleList([GraphAttentionLayer(nfeat,down_ratio=down_ratio,sgat_on=sgat_on,cgat_on=cgat_on) for _ in range(self.nheads)])
+        # for i, attention in enumerate(self.attentions):
+        #     self.add_module('attention_{}'.format(i), attention)
+        self.attentions= GraphAttentionLayer(nfeat,down_ratio=down_ratio,sgat_on=sgat_on,cgat_on=cgat_on)
+
+        
+        self.gama = nn.Parameter(torch.zeros(1))
+
+        self.output_down = nn.Sequential( 
+        nn.Conv2d(in_channels=nfeat, out_channels=nfeat, 
+                kernel_size=1, stride=1, padding=0, bias=False), #输入 in_features 2048 输出hid_features  in_features//down_ratio
+        nn.BatchNorm2d(nfeat),
+		nn.ReLU()
+
+		)
+
+    def forward(self, x):#resnet输入的维度为 b 2048 16 8 
+        b,c,h,w = x.size()
+        # x = F.dropout(x, self.dropout, training=self.training)
+        #     h_prime = torch.cat([att(x) for att in self.attentions], dim=1)  #通道直接拼接上还是 如果维度变为1024 则最终 b n 4096 考虑
+        #     h_prime =  self.output_down(h_prime)#到这一步已经算是进行了两次的GCN  在这一部分中再次将维度恢复到2048
+        h_prime =self.attentions(x)
+        # if  self.nheads > 1 :
+        #     h_prime = torch.cat([att(x) for att in self.attentions], dim=1)  #通道直接拼接上还是 如果维度变为1024 则最终 b n 4096 考虑
+        #     h_prime =  self.output_down(h_prime)#到这一步已经算是进行了两次的GCN  在这一部分中再次将维度恢复到2048
+        # else:
+        #     h_prime =self.attention_0(x)
+        #x = F.dropout(x, self.dropout, training=self.training) 
+        #x = F.dropout(x, self.dropout, training=self.training) 
+        h_prime = F.elu(h_prime) #因为输入x是经果relu的所有这里也需要经过这个然后输入res中
+        h_prime = (1-self.gama)*x+self.gama*h_prime #残差
+        # print('cancha ')
+        return h_prime 
 
 class PointRecuder(nn.Module):
     """
@@ -125,6 +344,7 @@ class Cluster(nn.Module):
         super().__init__()
         self.heads = heads
         self.head_dim = head_dim
+        self.return_center_dim = head_dim * heads
         self.f = nn.Conv2d(dim, heads * head_dim, kernel_size=1)  # for similarity
         self.proj = nn.Conv2d(heads * head_dim, out_dim, kernel_size=1)  # for projecting channel number
         self.v = nn.Conv2d(dim, heads * head_dim, kernel_size=1)  # for value
@@ -134,9 +354,9 @@ class Cluster(nn.Module):
         self.fold_w = fold_w
         self.fold_h = fold_h
         self.return_center = return_center
+        self.pga = GAT(self.return_center_dim)
 
     def forward(self, x):  # [b,c,w,h]
-        pdb.set_trace()
         # input torch.Size([32, 32, 56, 56])
         value = self.v(x)  # torch.Size([32, 96, 56, 56])
         x = self.f(x)   #  torch.Size([32, 96, 56, 56])
@@ -153,7 +373,15 @@ class Cluster(nn.Module):
                           f2=self.fold_h)  # [bs*blocks,c,ks[0],ks[1]] torch.Size([8192, 24, 7, 7])
             value = rearrange(value, "b c (f1 w) (f2 h) -> (b f1 f2) c w h", f1=self.fold_w, f2=self.fold_h)
         b, c, w, h = x.shape
+        # pdb.set_trace()
         centers = self.centers_proposal(x)  # torch.Size([B, 24, 2, 2]), we set M = C_W*C_H and N = w*h
+        return_centers = rearrange(centers, "(b f1 f2) c w h -> b c (f1 w) (f2 h)", f1=self.fold_w, f2=self.fold_h)
+        return_centers = rearrange(return_centers, "(b e) c w h -> b (e c) w h", e=self.heads)
+        return_centers = self.pga(return_centers)
+        # return_centers = self.pga(return_centers)
+        # return_centers = self.pga(return_centers)
+        centers = rearrange(return_centers, "b (e c) w h -> (b e) c w h",e=self.heads)
+        centers = rearrange(centers, "b c (f1 w) (f2 h) -> (b f1 f2) c w h", f1=self.fold_w, f2=self.fold_h)
         value_centers = rearrange(self.centers_proposal(value), 'b c w h -> b (w h) c')  # torch.Size([B, 4, 24]) 
         b, c, ww, hh = centers.shape
         sim = torch.sigmoid(
@@ -335,7 +563,6 @@ class ContextCluster(nn.Module):
                  **kwargs):
 
         super().__init__()
-
         if not fork_feat:
             self.num_classes = num_classes
         self.fork_feat = fork_feat
@@ -566,7 +793,7 @@ def coc_small(pretrained=False, **kwargs):
         mlp_ratios=mlp_ratios, downsamples=downsamples,
         down_patch_size=down_patch_size, down_pad=down_pad,
         proposal_w=proposal_w, proposal_h=proposal_h, fold_w=fold_w, fold_h=fold_h,
-        heads=heads, head_dim=head_dim,
+        heads=heads, head_dim=head_dim,fork_feat=False,
         **kwargs)
     model.default_cfg = default_cfgs['model_small']
     return model

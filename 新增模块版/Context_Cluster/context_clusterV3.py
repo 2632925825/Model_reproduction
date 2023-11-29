@@ -1,5 +1,6 @@
 """
 ContextCluster implementation
+bat
 # --------------------------------------------------------
 # Context Cluster -- Image as Set of Points, ICLR'23 Oral
 # Licensed under The MIT License [see LICENSE for details]
@@ -88,6 +89,26 @@ class GroupNorm(nn.GroupNorm):
     def __init__(self, num_channels, **kwargs):
         super().__init__(1, num_channels, **kwargs)
 
+class senet(nn.Module):
+    def __init__(self, channel, ratio=6):
+        super(senet, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // ratio, False),
+            nn.ReLU(),
+            nn.Linear(channel // ratio, channel, False),
+            nn.Sigmoid(),
+        )
+    
+    def forward(self, x):
+        b, c, h, w = x.size()
+        avg = self.avg_pool(x).view([b,c])
+        fc = self.fc(avg).view([b,c,1,1])
+        return x * fc
+
+        
+
+
 
 def pairwise_cos_sim(x1: torch.Tensor, x2: torch.Tensor):
     """
@@ -131,12 +152,14 @@ class Cluster(nn.Module):
         self.sim_alpha = nn.Parameter(torch.ones(1))
         self.sim_beta = nn.Parameter(torch.zeros(1))
         self.centers_proposal = nn.AdaptiveAvgPool2d((proposal_w, proposal_h))
+        self.semoudle = senet(24)
         self.fold_w = fold_w
         self.fold_h = fold_h
         self.return_center = return_center
+        self.agg = nn.Conv1d(head_dim, 1,1)
 
     def forward(self, x):  # [b,c,w,h]
-        pdb.set_trace()
+        # pdb.set_trace()
         # input torch.Size([32, 32, 56, 56])
         value = self.v(x)  # torch.Size([32, 96, 56, 56])
         x = self.f(x)   #  torch.Size([32, 96, 56, 56])
@@ -153,8 +176,16 @@ class Cluster(nn.Module):
                           f2=self.fold_h)  # [bs*blocks,c,ks[0],ks[1]] torch.Size([8192, 24, 7, 7])
             value = rearrange(value, "b c (f1 w) (f2 h) -> (b f1 f2) c w h", f1=self.fold_w, f2=self.fold_h)
         b, c, w, h = x.shape
+        # pdb.set_trace()
         centers = self.centers_proposal(x)  # torch.Size([B, 24, 2, 2]), we set M = C_W*C_H and N = w*h
+        centers = self.semoudle(centers)
         value_centers = rearrange(self.centers_proposal(value), 'b c w h -> b (w h) c')  # torch.Size([B, 4, 24]) 
+        # value_centers = self.centers_proposal(value)
+        # value_out_centers = rearrange(value_centers, "(b f1 f2) c w h -> b c (f1 w) (f2 h)", f1=self.fold_w, f2=self.fold_h) # torch.Size([128, 24, 16, 16])
+        # value_out_centers = rearrange(value_out_centers, "(b e) c w h -> b (e c) w h", e=self.heads) # torch.Size([32, 96, 16, 16])
+        # left = value_out_centers.reshape(32,96,-1).permute(0,2,1)
+        # right = torch.transpose(value_out_centers,-2,-1).reshape(32,96,-1).permute(0,2,1)
+        # sim2 = torch.sigmoid(pairwise_cos_sim(left,right))
         b, c, ww, hh = centers.shape
         sim = torch.sigmoid(
             self.sim_beta +
@@ -173,12 +204,15 @@ class Cluster(nn.Module):
         out = ((value2.unsqueeze(dim=1) * sim.unsqueeze(dim=-1)).sum(dim=2) + value_centers) / (
                     sim.sum(dim=-1, keepdim=True) + 1.0)  # [B,M,D] torch.Size([8192, 4, 24])
 
-        if self.return_center:
-            out = rearrange(out, "b (w h) c -> b c w h", w=ww) # 返回中心点的值 能不能让这些中心点之间的距离分开
-        else:
-            # dispatch step, return to each point in a cluster
-            out = (out.unsqueeze(dim=2) * sim.unsqueeze(dim=-1)).sum(dim=1)  # [B,N,D]
-            out = rearrange(out, "b (w h) c -> b c w h", w=w)
+        # pdb.set_trace()
+        # out_centers = rearrange(out, "b (w h) c -> b c w h", w=ww) # 返回中心点的值 能不能让这些中心点之间的距离分开 [8192, 24, 2,2]
+        # out_centers = rearrange(out_centers, "(b f1 f2) c w h -> b c (f1 w) (f2 h)", f1=self.fold_w, f2=self.fold_h) # torch.Size([128, 24, 16, 16])
+        # out_centers = rearrange(out_centers, "(b e) c w h -> b (e c) w h", e=self.heads) # torch.Size([32, 96, 16, 16])
+        # out_centers_agg = self.agg(out_centers.reshape(b,c,-1))
+        # out_centers_agg_matrix = torch.matmul(out_centers_agg,out_centers_agg.transpose(-2,-1))
+        # dispatch step, return to each point in a cluster
+        out = (out.unsqueeze(dim=2) * sim.unsqueeze(dim=-1)).sum(dim=1)  # [B,N,D]
+        out = rearrange(out, "b (w h) c -> b c w h", w=w)
         # 进行复原
         if self.fold_w > 1 and self.fold_h > 1:
             # recover the splited regions back to big feature maps if use the region partition.
